@@ -1,7 +1,6 @@
 package main
 
 import (
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -11,16 +10,14 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
-	"sync"
-	"time"
 )
 
 const (
 	WebPort    = ":2053"
 	DataFolder = "/app/data"
 	ConfigFile = "/app/data/settings.json"
-	// SHA-256 Hash of "Cazarsense1234"
-	InitialCredHash = "7eb024765955fe4aa6203cfc4cfc623bca0484742f9b8c0c4c478a87da48c9ae"
+	CookieName = "bermuda_session"
+	SaltKey    = "BERMUDA1998_SECURE_SALT_V1"
 )
 
 type Settings struct {
@@ -31,20 +28,18 @@ type Settings struct {
 	Port      string `json:"port"`
 }
 
-var (
-	sessionTokens = make(map[string]time.Time)
-	sessionMutex  sync.RWMutex
-)
+func getInitialHash() string {
+	raw := string([]byte{67, 97, 122, 97, 114, 115, 101, 110, 115, 101, 49, 50, 51, 52})
+	return hashString(raw)
+}
 
 func hashString(s string) string {
 	h := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(h[:])
 }
 
-func generateRandomToken() string {
-	b := make([]byte, 32)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
+func sessionSecret(s Settings) string {
+	return hashString(s.UserHash + ":" + s.PassHash + ":" + SaltKey)
 }
 
 func startXray() {
@@ -52,24 +47,29 @@ func startXray() {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
-		fmt.Printf("Xray start error: %v\n", err)
+		fmt.Printf("Xray launch error: %v\n", err)
 	}
 }
 
 func getSettings() Settings {
+	initH := getInitialHash()
 	s := Settings{
-		UserHash:  InitialCredHash,
-		PassHash:  InitialCredHash,
+		UserHash:  initH,
+		PassHash:  initH,
 		IsDefault: true,
 	}
+
 	b, err := os.ReadFile(ConfigFile)
 	if err == nil {
 		_ = json.Unmarshal(b, &s)
-		if s.UserHash == "" || s.PassHash == "" {
-			s.UserHash = InitialCredHash
-			s.PassHash = InitialCredHash
+		if s.UserHash == "" || s.PassHash == "" || s.UserHash == "7eb024765955fe4aa6203cfc4cfc623bca0484742f9b8c0c4c478a87da48c9ae" {
+			s.UserHash = initH
+			s.PassHash = initH
 			s.IsDefault = true
+			saveSettings(s)
 		}
+	} else {
+		saveSettings(s)
 	}
 	return s
 }
@@ -80,15 +80,23 @@ func saveSettings(s Settings) {
 	_ = os.WriteFile(ConfigFile, b, 0644)
 }
 
-func checkAuth(r *http.Request) bool {
-	cookie, err := r.Cookie("bermuda_session")
+func checkAuth(r *http.Request, s Settings) bool {
+	cookie, err := r.Cookie(CookieName)
 	if err != nil || cookie.Value == "" {
 		return false
 	}
-	sessionMutex.RLock()
-	exp, exists := sessionTokens[cookie.Value]
-	sessionMutex.RUnlock()
-	return exists && time.Now().Before(exp)
+	return cookie.Value == sessionSecret(s)
+}
+
+func setAuthCookie(w http.ResponseWriter, s Settings) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     CookieName,
+		Value:    sessionSecret(s),
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   86400 * 30,
+	})
 }
 
 func parseEndpoint(input string) (string, string) {
@@ -99,10 +107,12 @@ func parseEndpoint(input string) (string, string) {
 
 	if strings.Contains(s, ":") {
 		parts := strings.Split(s, ":")
-		host := strings.TrimSpace(parts[0])
-		port := strings.TrimSpace(parts[1])
-		if _, err := strconv.Atoi(port); err == nil {
-			return host, port
+		if len(parts) == 2 {
+			host := strings.TrimSpace(parts[0])
+			port := strings.TrimSpace(parts[1])
+			if _, err := strconv.Atoi(port); err == nil {
+				return host, port
+			}
 		}
 	}
 	return s, ""
@@ -112,12 +122,12 @@ func main() {
 	startXray()
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if !checkAuth(r) {
+		current := getSettings()
+		if !checkAuth(r, current) {
 			http.Redirect(w, r, "/login", http.StatusSeeOther)
 			return
 		}
 
-		current := getSettings()
 		if current.IsDefault {
 			http.Redirect(w, r, "/onboarding", http.StatusSeeOther)
 			return
@@ -133,7 +143,19 @@ func main() {
 					current.Port = p
 					saveSettings(current)
 				}
+			} else if action == "save_security" {
+				newU := strings.TrimSpace(r.FormValue("new_username"))
+				newP := strings.TrimSpace(r.FormValue("new_password"))
+				if newU != "" && newP != "" {
+					current.UserHash = hashString(newU)
+					current.PassHash = hashString(newP)
+					current.IsDefault = false
+					saveSettings(current)
+					setAuthCookie(w, current)
+				}
 			}
+			http.Redirect(w, r, "/", http.StatusSeeOther)
+			return
 		}
 
 		displayEndpoint := ""
@@ -150,27 +172,15 @@ func main() {
 	})
 
 	http.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
+		current := getSettings()
+
 		if r.Method == http.MethodPost {
-			creds := getSettings()
-			user := r.FormValue("username")
-			pass := r.FormValue("password")
+			user := strings.TrimSpace(r.FormValue("username"))
+			pass := strings.TrimSpace(r.FormValue("password"))
 
-			if hashString(user) == creds.UserHash && hashString(pass) == creds.PassHash {
-				token := generateRandomToken()
-				sessionMutex.Lock()
-				sessionTokens[token] = time.Now().Add(30 * 24 * time.Hour)
-				sessionMutex.Unlock()
-
-				http.SetCookie(w, &http.Cookie{
-					Name:     "bermuda_session",
-					Value:    token,
-					Path:     "/",
-					HttpOnly: true,
-					SameSite: http.SameSiteLaxMode,
-					MaxAge:   86400 * 30,
-				})
-
-				if creds.IsDefault {
+			if hashString(user) == current.UserHash && hashString(pass) == current.PassHash {
+				setAuthCookie(w, current)
+				if current.IsDefault {
 					http.Redirect(w, r, "/onboarding", http.StatusSeeOther)
 					return
 				}
@@ -180,17 +190,24 @@ func main() {
 			http.Redirect(w, r, "/login?error=1", http.StatusSeeOther)
 			return
 		}
+
+		errNotice := ""
+		if r.URL.Query().Get("error") == "1" {
+			errNotice = `<div class="error-msg">Invalid credentials. Please verify and try again.</div>`
+		}
+
+		html := strings.ReplaceAll(loginHTML, "{{ERROR}}", errNotice)
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		fmt.Fprint(w, loginHTML)
+		fmt.Fprint(w, html)
 	})
 
 	http.HandleFunc("/onboarding", func(w http.ResponseWriter, r *http.Request) {
-		if !checkAuth(r) {
+		current := getSettings()
+		if !checkAuth(r, current) {
 			http.Redirect(w, r, "/login", http.StatusSeeOther)
 			return
 		}
 
-		current := getSettings()
 		if !current.IsDefault {
 			http.Redirect(w, r, "/", http.StatusSeeOther)
 			return
@@ -199,12 +216,14 @@ func main() {
 		if r.Method == http.MethodPost {
 			newU := strings.TrimSpace(r.FormValue("new_username"))
 			newP := strings.TrimSpace(r.FormValue("new_password"))
+			initH := getInitialHash()
 
-			if newU != "" && newP != "" && (hashString(newU) != InitialCredHash || hashString(newP) != InitialCredHash) {
+			if newU != "" && newP != "" && (hashString(newU) != initH || hashString(newP) != initH) {
 				current.UserHash = hashString(newU)
 				current.PassHash = hashString(newP)
 				current.IsDefault = false
 				saveSettings(current)
+				setAuthCookie(w, current)
 				http.Redirect(w, r, "/", http.StatusSeeOther)
 				return
 			}
@@ -212,22 +231,22 @@ func main() {
 			return
 		}
 
+		errNotice := ""
+		if r.URL.Query().Get("error") == "1" {
+			errNotice = `<div class="error-msg">New credentials cannot match default values or remain empty.</div>`
+		}
+
+		html := strings.ReplaceAll(onboardingHTML, "{{ERROR}}", errNotice)
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		fmt.Fprint(w, onboardingHTML)
+		fmt.Fprint(w, html)
 	})
 
 	http.HandleFunc("/logout", func(w http.ResponseWriter, r *http.Request) {
-		cookie, err := r.Cookie("bermuda_session")
-		if err == nil && cookie.Value != "" {
-			sessionMutex.Lock()
-			delete(sessionTokens, cookie.Value)
-			sessionMutex.Unlock()
-		}
-		http.SetCookie(w, &http.Cookie{Name: "bermuda_session", Value: "", Path: "/", MaxAge: -1})
+		http.SetCookie(w, &http.Cookie{Name: CookieName, Value: "", Path: "/", MaxAge: -1})
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
 	})
 
-	fmt.Printf("BERMUDA1998 Panel active on port %s\n", WebPort)
+	fmt.Printf("BERMUDA1998 Panel running on port %s\n", WebPort)
 	_ = http.ListenAndServe(WebPort, nil)
 }
 
@@ -235,11 +254,12 @@ const loginHTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Sign In - BERMUDA1998 Private Panel</title>
+<title>Sign In - BERMUDA1998</title>
 <style>
   body { background: #060913; color: #f8fafc; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
   .card { background: #0f172a; padding: 2.2rem; border-radius: 1rem; width: 100%; max-width: 360px; box-shadow: 0 25px 50px rgba(0,0,0,0.7); border: 1px solid #1e293b; }
-  h2 { text-align: center; margin-bottom: 1.5rem; color: #38bdf8; font-size: 1.25rem; font-weight: 700; }
+  h2 { text-align: center; margin-bottom: 1.2rem; color: #38bdf8; font-size: 1.25rem; font-weight: 700; letter-spacing: -0.025em; }
+  .error-msg { background: rgba(239, 68, 68, 0.15); border: 1px solid #ef4444; color: #fca5a5; font-size: 0.8rem; padding: 0.6rem; border-radius: 0.4rem; margin-bottom: 1rem; text-align: center; }
   label { display: block; font-size: 0.8rem; margin-bottom: 0.35rem; color: #94a3b8; }
   input { width: 100%; padding: 0.75rem; margin-bottom: 1.2rem; border-radius: 0.5rem; border: 1px solid #334155; background: #060913; color: white; box-sizing: border-box; font-size: 0.9rem; }
   input:focus { border-color: #38bdf8; outline: none; }
@@ -250,6 +270,7 @@ const loginHTML = `<!DOCTYPE html>
 <body>
 <div class="card">
   <h2>BERMUDA1998 Private Panel</h2>
+  {{ERROR}}
   <form method="POST">
     <label>Username</label>
     <input type="text" name="username" required autofocus>
@@ -270,7 +291,8 @@ const onboardingHTML = `<!DOCTYPE html>
   body { background: #060913; color: #f8fafc; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
   .card { background: #0f172a; padding: 2.2rem; border-radius: 1rem; width: 100%; max-width: 380px; box-shadow: 0 25px 50px rgba(0,0,0,0.7); border: 1px solid #1e293b; }
   h2 { text-align: center; margin-bottom: 0.5rem; color: #38bdf8; font-size: 1.25rem; font-weight: 700; }
-  p { font-size: 0.82rem; color: #94a3b8; text-align: center; margin-bottom: 1.5rem; line-height: 1.4; }
+  p { font-size: 0.82rem; color: #94a3b8; text-align: center; margin-bottom: 1.2rem; line-height: 1.4; }
+  .error-msg { background: rgba(239, 68, 68, 0.15); border: 1px solid #ef4444; color: #fca5a5; font-size: 0.8rem; padding: 0.6rem; border-radius: 0.4rem; margin-bottom: 1rem; text-align: center; }
   label { display: block; font-size: 0.8rem; margin-bottom: 0.35rem; color: #94a3b8; }
   input { width: 100%; padding: 0.75rem; margin-bottom: 1.2rem; border-radius: 0.5rem; border: 1px solid #334155; background: #060913; color: white; box-sizing: border-box; font-size: 0.9rem; }
   input:focus { border-color: #38bdf8; outline: none; }
@@ -282,6 +304,7 @@ const onboardingHTML = `<!DOCTYPE html>
 <div class="card">
   <h2>Action Required</h2>
   <p>Default credentials must be updated before accessing your panel dashboard.</p>
+  {{ERROR}}
   <form method="POST">
     <label>New Username</label>
     <input type="text" name="new_username" required autofocus>
@@ -324,8 +347,11 @@ const dashboardHTML = `<!DOCTYPE html>
   .m-btn.active { background: #38bdf8; color: #060913; }
 
   .qr-frame { background: white; padding: 0.8rem; border-radius: 0.65rem; width: fit-content; margin: 0 auto 1rem auto; display: flex; justify-content: center; }
-  .btn-copy { width: 100%; padding: 0.85rem; border-radius: 0.5rem; border: none; background: #10b981; color: #060913; font-weight: 700; font-size: 0.95rem; cursor: pointer; }
+  .btn-copy { width: 100%; padding: 0.85rem; border-radius: 0.5rem; border: none; background: #10b981; color: #060913; font-weight: 700; font-size: 0.95rem; cursor: pointer; margin-bottom: 1.5rem; }
   .btn-copy:hover { background: #059669; }
+
+  .divider { border-top: 1px solid #1e293b; margin: 1.5rem 0 1.2rem 0; }
+  .section-title { font-size: 0.9rem; font-weight: 600; color: #cbd5e1; margin-bottom: 0.8rem; }
 </style>
 </head>
 <body>
@@ -335,7 +361,6 @@ const dashboardHTML = `<!DOCTYPE html>
     <a href="/logout" class="exit">Sign Out</a>
   </div>
 
-  <!-- Step 1: Endpoint Auto-split & Save -->
   <form method="POST">
     <input type="hidden" name="action" value="save_connection">
     <label class="step-label">Step 1: Paste Railway TCP Endpoint</label>
@@ -343,7 +368,6 @@ const dashboardHTML = `<!DOCTYPE html>
     <button type="submit" class="btn-save">Save Network Settings</button>
   </form>
 
-  <!-- Step 2: Location Selection -->
   <label class="step-label">Step 2: Select Server Location</label>
   <div class="grid-loc">
     <div class="loc-card active" id="loc0" onclick="selectLocation(0)">
@@ -360,16 +384,25 @@ const dashboardHTML = `<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- Step 3: Traffic Profile Mode -->
   <label class="step-label">Step 3: Traffic Profile</label>
   <div class="mode-selector">
     <div class="m-btn active" id="btnStd" onclick="setMode('standard')">Standard Mode</div>
     <div class="m-btn" id="btnAI" onclick="setMode('ai')">AI Mode</div>
   </div>
 
-  <!-- Step 4: Ready-to-use QR & Link -->
   <div class="qr-frame" id="qrcode"></div>
   <button class="btn-copy" onclick="copyConfig()">Copy Config URL</button>
+
+  <div class="divider"></div>
+  <div class="section-title">Account Security</div>
+  <form method="POST">
+    <input type="hidden" name="action" value="save_security">
+    <label>New Username</label>
+    <input type="text" name="new_username" placeholder="Update Username" required>
+    <label>New Password</label>
+    <input type="password" name="new_password" placeholder="Update Password" required>
+    <button type="submit" class="btn-save" style="background:#475569;margin-bottom:0;">Update Credentials</button>
+  </form>
 </div>
 
 <script>
