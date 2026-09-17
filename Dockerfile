@@ -1,7 +1,7 @@
 FROM golang:1.22-alpine AS builder
 WORKDIR /build
 COPY main.go .
-RUN go mod init cazar-panel && go build -ldflags="-s -w" -o cazar-panel main.go
+RUN go mod init bermuda-panel && go build -ldflags="-s -w" -o bermuda-panel main.go
 
 FROM alpine:3.19
 WORKDIR /app
@@ -13,7 +13,7 @@ RUN apk add --no-cache curl ca-certificates && \
     rm xray.zip
 
 COPY config.json /app/config.json
-COPY --from=builder /build/cazar-panel /app/cazar-panel
+COPY --from=builder /build/bermuda-panel /app/bermuda-panel
 
 EXPOSE 2053 443
-CMD ["/app/cazar-panel"]
+CMD ["/app/bermuda-panel"]
